@@ -57,13 +57,13 @@ async def local_ai_generate(channel_id: int, username: str, user_message: str) -
     if any(tok in lower.split() for tok in greetings_in):
         reply = random.choice([
             f"Olá, {username}! Como posso ajudar você hoje?",
-            "Oi! Me conta o que você quer saber 😊",
+            "Oi! Me conta o que você quer saber",
             "E aí! Em que posso ajudar?"
         ])
 
     elif "obrigad" in lower or "valeu" in lower:
         reply = random.choice([
-            "Por nada! 😊",
+            "Por nada!",
             "De nada — se precisar, estou por aqui!",
             "Imagina, fico feliz em ajudar!"
         ])
@@ -124,7 +124,7 @@ async def _call_g4f_in_thread(messages, provider):
 async def ask_ai(channel_id: int, username: str, user_message: str) -> str:
     """
     Usa g4f (Yqcloud / OperaAria) sem precisar de API key.
-    Fallback para IA local se ambos falharem ou se FORCEL_LOCAL=1 estiver definido.
+    Fallback para IA local se ambos falharem ou se FORCE_LOCAL=1 estiver definido.
     """
     if os.environ.get("FORCE_LOCAL", "") == "1":
         return await local_ai_generate(channel_id, username, user_message)
@@ -207,7 +207,7 @@ async def on_message(message: discord.Message):
             content = content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
         if not content:
-            await message.reply("Olá! 👋 Me manda uma mensagem ou usa `/ai` para conversar comigo!")
+            await message.reply("Olá! Me manda uma mensagem ou usa `/ai` para conversar comigo!")
             return
 
         async with message.channel.typing():
@@ -222,9 +222,74 @@ async def on_message(message: discord.Message):
                         await message.channel.send(chunk)
             except Exception as e:
                 print(f"[ERRO] IA falhou: {e}")
-                await message.reply("❌ A IA está indisponível no momento. Tenta de novo!")
+                await message.reply("A IA está indisponível no momento. Tenta de novo!")
 
     await bot.process_commands(message)
+
+
+# ─── Boas-vindas ao entrar no servidor ───────────────────────────────────────
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """
+    Envia a mensagem de boas-vindas no 'chat geral' do servidor.
+    Fluxo:
+      1) Procura por canais com nomes comuns de 'geral' (chat geral, chat-geral, geral, general)
+      2) Se não encontrar, tenta system_channel
+      3) Se não, tenta o primeiro canal de texto em que o bot tenha permissão para enviar
+      4) Como último recurso, envia por DM ao membro
+    """
+    # Mensagem fornecida pelo usuário (mantida exatamente)
+    welcome_text = (
+        "Bem-vindo à Nova Era.\n\n"
+        "Sua jornada começa agora. Participe das nossas noites de jogos, interaja com a comunidade e faça novas amizades.\n\n"
+        "Antes de seguir, confira os canais #seja-booster e #leveis・levels para conhecer todas as vantagens e recompensas disponíveis.\n\n"
+        "O futuro começa aqui."
+    )
+
+    # Vou mencionar o usuário para chamar atenção, mantendo o resto do texto igual
+    text_to_send = f"{member.mention}\n\n{welcome_text}"
+
+    guild = member.guild
+
+    # 1) procura por nomes comuns de canal "geral"
+    candidates = ["chat geral", "chat-geral", "geral", "general"]
+    target_channel = None
+    for name in candidates:
+        for ch in guild.text_channels:
+            if ch.name.lower() == name and ch.permissions_for(guild.me).send_messages:
+                target_channel = ch
+                break
+        if target_channel:
+            break
+
+    # 2) se não achou, tenta system_channel
+    if not target_channel and guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+        target_channel = guild.system_channel
+
+    # 3) se ainda não, pega o primeiro canal de texto com permissão
+    if not target_channel:
+        for ch in guild.text_channels:
+            if ch.permissions_for(guild.me).send_messages:
+                target_channel = ch
+                break
+
+    sent = False
+    if target_channel:
+        try:
+            await target_channel.send(text_to_send)
+            sent = True
+        except Exception as e:
+            print(f"[AVISO] Falha ao enviar boas-vindas em canal {target_channel}: {e}")
+            sent = False
+
+    # 4) por fim, tenta DM
+    if not sent:
+        try:
+            await member.send(welcome_text)
+            sent = True
+        except Exception as e:
+            print(f"[AVISO] Não foi possível enviar DM ao membro {member}: {e}")
 
 
 # ─── Comando /ai ──────────────────────────────────────────────────────────────
@@ -239,12 +304,12 @@ async def ai_command(interaction: discord.Interaction, pergunta: str = None, lim
 
     if limpar:
         clear_history(interaction.channel_id)
-        await interaction.followup.send("🧹 Histórico de conversa deste canal foi limpo!")
+        await interaction.followup.send("Histórico de conversa deste canal foi limpo!")
         return
 
     if not pergunta:
         await interaction.followup.send(
-            "💬 Use `/ai pergunta:Sua mensagem` para conversar.\n"
+            "Use `/ai pergunta:Sua mensagem` para conversar.\n"
             "Use `/ai limpar:True` para limpar o histórico."
         )
         return
@@ -267,7 +332,7 @@ async def ai_command(interaction: discord.Interaction, pergunta: str = None, lim
                 await interaction.followup.send(chunk)
     except Exception as e:
         print(f"[ERRO] comando /ai falhou: {e}")
-        await interaction.followup.send("❌ A IA está indisponível no momento. Tente novamente!")
+        await interaction.followup.send("A IA está indisponível no momento. Tente novamente!")
 
 
 # ─── Comando /ban ─────────────────────────────────────────────────────────────
@@ -279,23 +344,23 @@ async def ban_command(interaction: discord.Interaction, membro: discord.Member, 
     await interaction.response.defer(ephemeral=True)
 
     if not membro.is_bannable():
-        await interaction.followup.send("❌ Não consigo banir esse membro (cargo superior ou igual ao meu).")
+        await interaction.followup.send("Não consigo banir esse membro (cargo superior ou igual ao meu).")
         return
 
     try:
         await membro.ban(delete_message_days=dias, reason=motivo)
-        embed = discord.Embed(title="🔨 Membro Banido", color=0xFF0000)
+        embed = discord.Embed(title="Membro Banido", color=0xFF0000)
         embed.add_field(name="Membro", value=str(membro), inline=True)
         embed.add_field(name="Motivo", value=motivo, inline=True)
         embed.add_field(name="Moderador", value=str(interaction.user), inline=True)
         await interaction.followup.send(embed=embed)
         try:
-            await membro.send(f"Você foi **banido** do servidor **{interaction.guild.name}**.\nMotivo: {motivo}")
+            await membro.send(f"Você foi banido do servidor {interaction.guild.name}.\nMotivo: {motivo}")
         except Exception:
             pass
     except Exception as e:
         print(f"[ERRO] ao banir: {e}")
-        await interaction.followup.send("❌ Erro ao banir o membro.")
+        await interaction.followup.send("Erro ao banir o membro.")
 
 
 # ─── Comando /kick ────────────────────────────────────────────────────────────
@@ -307,23 +372,23 @@ async def kick_command(interaction: discord.Interaction, membro: discord.Member,
     await interaction.response.defer(ephemeral=True)
 
     if not membro.is_kickable():
-        await interaction.followup.send("❌ Não consigo expulsar esse membro (cargo superior ou igual ao meu).")
+        await interaction.followup.send("Não consigo expulsar esse membro (cargo superior ou igual ao meu).")
         return
 
     try:
         await membro.kick(reason=motivo)
-        embed = discord.Embed(title="👟 Membro Expulso", color=0xFF8800)
+        embed = discord.Embed(title="Membro Expulso", color=0xFF8800)
         embed.add_field(name="Membro", value=str(membro), inline=True)
         embed.add_field(name="Motivo", value=motivo, inline=True)
         embed.add_field(name="Moderador", value=str(interaction.user), inline=True)
         await interaction.followup.send(embed=embed)
         try:
-            await membro.send(f"Você foi **expulso** do servidor **{interaction.guild.name}**.\nMotivo: {motivo}")
+            await membro.send(f"Você foi expulso do servidor {interaction.guild.name}.\nMotivo: {motivo}")
         except Exception:
             pass
     except Exception as e:
         print(f"[ERRO] ao expulsar: {e}")
-        await interaction.followup.send("❌ Erro ao expulsar o membro.")
+        await interaction.followup.send("Erro ao expulsar o membro.")
 
 
 # ─── Comando /timeout ─────────────────────────────────────────────────────────
@@ -337,7 +402,7 @@ async def timeout_command(interaction: discord.Interaction, membro: discord.Memb
     try:
         await membro.timeout(timedelta(minutes=minutos), reason=motivo)
         duracao = f"{minutos // 60}h {minutos % 60}min" if minutos >= 60 else f"{minutos} minutos"
-        embed = discord.Embed(title="🔇 Membro Silenciado", color=0xFFCC00)
+        embed = discord.Embed(title="Membro Silenciado", color=0xFFCC00)
         embed.add_field(name="Membro", value=str(membro), inline=True)
         embed.add_field(name="Duração", value=duracao, inline=True)
         embed.add_field(name="Motivo", value=motivo, inline=False)
@@ -345,7 +410,7 @@ async def timeout_command(interaction: discord.Interaction, membro: discord.Memb
         await interaction.followup.send(embed=embed)
     except Exception as e:
         print(f"[ERRO] ao aplicar timeout: {e}")
-        await interaction.followup.send("❌ Erro ao silenciar o membro.")
+        await interaction.followup.send("Erro ao silenciar o membro.")
 
 
 # ─── Advertências ─────────────────────────────────────────────────────────────
@@ -367,7 +432,7 @@ async def warn_command(interaction: discord.Interaction, membro: discord.Member,
     })
     total = len(warn_store[interaction.guild_id][membro.id])
 
-    embed = discord.Embed(title="⚠️ Advertência Aplicada", color=0xFFA500)
+    embed = discord.Embed(title="Advertência Aplicada", color=0xFFA500)
     embed.add_field(name="Membro", value=str(membro), inline=True)
     embed.add_field(name="Total de Avisos", value=str(total), inline=True)
     embed.add_field(name="Motivo", value=motivo, inline=False)
@@ -376,7 +441,7 @@ async def warn_command(interaction: discord.Interaction, membro: discord.Member,
 
     try:
         await membro.send(
-            f"Você recebeu uma **advertência** no servidor **{interaction.guild.name}**.\n"
+            f"Você recebeu uma advertência no servidor {interaction.guild.name}.\n"
             f"Motivo: {motivo}\nTotal de advertências: {total}"
         )
     except Exception:
@@ -391,14 +456,14 @@ async def warns_command(interaction: discord.Interaction, membro: discord.Member
 
     avisos = warn_store[interaction.guild_id][membro.id]
     if not avisos:
-        await interaction.followup.send(f"✅ **{membro}** não possui advertências.")
+        await interaction.followup.send(f"{membro} não possui advertências.")
         return
 
     desc = "\n\n".join(
         f"**{i+1}.** {w['motivo']}\n> Por {w['moderador']} em {w['data']}"
         for i, w in enumerate(avisos)
     )
-    embed = discord.Embed(title=f"⚠️ Advertências de {membro}", description=desc, color=0xFFA500)
+    embed = discord.Embed(title=f"Advertências de {membro}", description=desc, color=0xFFA500)
     embed.set_footer(text=f"Total: {len(avisos)} advertência(s)")
     await interaction.followup.send(embed=embed)
 
@@ -418,11 +483,11 @@ async def clear_command(interaction: discord.Interaction, quantidade: app_comman
         deleted = await interaction.channel.purge(limit=quantidade if not membro else 200, check=check)
         deleted = deleted[:quantidade]
         await interaction.followup.send(
-            f"✅ {len(deleted)} mensagem(s) apagada(s)" + (f" de **{membro}**" if membro else "") + "."
+            f"{len(deleted)} mensagem(s) apagada(s)" + (f" de **{membro}**" if membro else "") + "."
         )
     except Exception as e:
         print(f"[ERRO] ao apagar mensagens: {e}")
-        await interaction.followup.send("❌ Erro ao apagar mensagens.")
+        await interaction.followup.send("Erro ao apagar mensagens.")
 
 
 # ─── Comando /userinfo ────────────────────────────────────────────────────────
@@ -435,7 +500,7 @@ async def userinfo_command(interaction: discord.Interaction, membro: discord.Mem
     alvo = membro or interaction.user
     avisos = warn_store[interaction.guild_id][alvo.id]
 
-    embed = discord.Embed(title=f"👤 {alvo}", color=0x5865F2)
+    embed = discord.Embed(title=f"{alvo}", color=0x5865F2)
     embed.set_thumbnail(url=alvo.display_avatar.url)
     embed.add_field(name="ID", value=str(alvo.id), inline=True)
     embed.add_field(name="Conta criada em", value=f"<t:{int(alvo.created_at.timestamp())}:D>", inline=True)
@@ -449,7 +514,7 @@ async def userinfo_command(interaction: discord.Interaction, membro: discord.Mem
             embed.add_field(name="Apelido", value=alvo.nick, inline=True)
 
     embed.add_field(
-        name="⚠️ Advertências",
+        name="Advertências",
         value="Nenhuma" if not avisos else f"{len(avisos)} advertência(s)",
         inline=True
     )
