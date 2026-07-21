@@ -7,8 +7,8 @@ import random
 import asyncio
 import traceback
 from datetime import timedelta, datetime
-from collections import defaultdict
-from typing import Optional
+from collections import defaultdict, OrderedDict
+from typing import Optional, Tuple
 
 import discord
 import g4f
@@ -27,10 +27,13 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ─── Configuráveis via ambiente (tune conforme infra) ────────────────────────
 G4F_TIMEOUT = int(os.getenv("G4F_TIMEOUT", "25"))        # segundos por provedor
-G4F_CONCURRENCY = int(os.getenv("G4F_CONCURRENCY", "2")) # chamadas concorrentes
-MAX_PROVIDER_RETRIES = int(os.getenv("G4F_RETRIES", "1"))
+G4F_CONCURRENCY = int(os.getenv("G4F_CONCURRENCY", "1")) # chamadas concorrentes (baixo para Termux)
+MAX_PROVIDER_RETRIES = int(os.getenv("G4F_RETRIES", "0"))
 PROVIDER_RETRY_DELAY = float(os.getenv("G4F_RETRY_DELAY", "1"))
 ai_semaphore = asyncio.Semaphore(G4F_CONCURRENCY)
+
+# Force local by default on Termux — can be overridden with env FORCE_LOCAL=0
+DEFAULT_FORCE_LOCAL = os.getenv("FORCE_LOCAL", "1") == "1"
 
 # ─── Help embed ───────────────────────────────────────────────────────────────
 
@@ -46,6 +49,8 @@ def build_help_embed() -> discord.Embed:
             "`!helpNova` — Mostra esta lista de comandos\n"
             "`!ai [pergunta]` — Conversa com a IA Nova Era\n"
             "`!ai limpar` — Limpa o histórico de conversa do canal\n"
+            "`!aimode [local|external|auto]` — Define modo de IA (admin)\n"
+            "`!aistatus` — Verifica provedores externos (diagnóstico)\n"
             "`!userinfo [@membro]` — Informações sobre um membro"
         ),
         inline=False
@@ -65,17 +70,43 @@ def build_help_embed() -> discord.Embed:
     embed.set_footer(text="Mencione um membro entre colchetes quando aplicável.")
     return embed
 
-# ─── IA (g4f + fallback local) ────────────────────────────────────────────────
+# ─── IA (local fast generator + opcional external) ───────────────────────────
 
 BASE_SYSTEM = (
     "Você é Nova Era, um bot de Discord prestativo, amigável e útil. "
     "Responda sempre em português brasileiro de forma natural e concisa."
 )
 
-MAX_HISTORY = 8
+MAX_HISTORY = 1  # reduzido para Termux
 
 # Histórico por canal: channel_id -> list de dicts
 conversation_history: dict[int, list[dict]] = defaultdict(list)
+
+# Modo de IA: per-guild override, values: 'local', 'external', 'auto'
+ai_mode_by_guild: dict[int, str] = defaultdict(lambda: 'local' if DEFAULT_FORCE_LOCAL else 'auto')
+
+# Simple in-memory LRU cache for recent Q->A to speed repeated requests
+class LRUCache:
+    def __init__(self, capacity: int = 256):
+        self.capacity = capacity
+        self.cache: OrderedDict[Tuple[int,str], str] = OrderedDict()
+
+    def get(self, key: Tuple[int,str]) -> Optional[str]:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+
+    def put(self, key: Tuple[int,str], value: str):
+        self.cache[key] = value
+        self.cache.move_to_end(key)
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
+
+    def clear(self):
+        self.cache.clear()
+
+ai_cache = LRUCache(256)
 
 
 async def local_ai_generate(channel_id: int, username: str, user_message: str) -> str:
@@ -139,26 +170,9 @@ async def _call_g4f_in_thread(messages, provider):
     return await asyncio.to_thread(sync_call)
 
 
-async def ask_ai(channel_id: int, username: str, user_message: str) -> str:
-    # Força local se variável definida
-    if os.environ.get("FORCE_LOCAL", "") == "1":
-        return await local_ai_generate(channel_id, username, user_message)
-
-    history = conversation_history[channel_id]
-
-    # monta mensagens (system + histórico + user)
-    messages = [{"role": "system", "content": BASE_SYSTEM}]
-    for h in history:
-        role = h.get("role")
-        if role == "user":
-            messages.append({"role": "user", "content": f"{h['username']}: {h['content']}"})
-        else:
-            messages.append({"role": "assistant", "content": h.get("content", "")})
-    messages.append({"role": "user", "content": f"{username}: {user_message}"})
-
+async def ask_ai_external(messages, channel_id: int, username: str, user_message: str) -> Optional[str]:
+    # external providers path
     last_error = None
-
-    # Limita concorrência em chamadas externas para evitar sobrecarga
     async with ai_semaphore:
         for provider in (Yqcloud, OperaAria):
             attempt = 0
@@ -169,7 +183,8 @@ async def ask_ai(channel_id: int, username: str, user_message: str) -> str:
                     if not reply:
                         raise Exception("Resposta vazia do provedor")
 
-                    # atualiza histórico
+                    # update history
+                    history = conversation_history[channel_id]
                     history.append({"username": username, "content": user_message, "role": "user"})
                     history.append({"username": "Nova Era", "content": reply, "role": "bot"})
                     if len(history) > MAX_HISTORY:
@@ -188,14 +203,66 @@ async def ask_ai(channel_id: int, username: str, user_message: str) -> str:
                 attempt += 1
                 if attempt <= MAX_PROVIDER_RETRIES:
                     await asyncio.sleep(PROVIDER_RETRY_DELAY)
+    return None
 
-    # Fallback local sem semaphore (rápido)
+
+async def ask_ai(channel_id: int, username: str, user_message: str) -> str:
+    # Check cache first
+    key = (channel_id, user_message.strip().lower())
+    cached = ai_cache.get(key)
+    if cached:
+        return cached
+
+    # Determine mode for this guild (if DM, use global default)
+    mode = 'local'
     try:
-        return await local_ai_generate(channel_id, username, user_message)
-    except Exception as e:
-        print(f"[ERRO] IA local também falhou: {e}")
-        traceback.print_exc()
-        raise last_error or e or Exception("IA indisponível")
+        # try to get guild id via conversation context: not available here so caller sets channel_id
+        # we keep mode by guild if possible; fallback to default
+        mode = ai_mode_by_guild.get(channel_id, ai_mode_by_guild.get(0, 'local'))
+    except Exception:
+        mode = 'local' if DEFAULT_FORCE_LOCAL else 'auto'
+
+    # If default FORCE_LOCAL then treat 'auto' as 'local' for Termux
+    if DEFAULT_FORCE_LOCAL and mode == 'auto':
+        mode = 'local'
+
+    # Local only
+    if mode == 'local':
+        reply = await local_ai_generate(channel_id, username, user_message)
+        ai_cache.put(key, reply)
+        return reply
+
+    # External only: prepare messages
+    messages = [{"role": "system", "content": BASE_SYSTEM}]
+    for h in conversation_history[channel_id]:
+        role = h.get("role")
+        if role == "user":
+            messages.append({"role": "user", "content": f"{h['username']}: {h['content']}"})
+        else:
+            messages.append({"role": "assistant", "content": h.get("content", "")})
+    messages.append({"role": "user", "content": f"{username}: {user_message}"})
+
+    # If auto: try external then fallback local
+    if mode == 'auto':
+        ext = await ask_ai_external(messages, channel_id, username, user_message)
+        if ext:
+            ai_cache.put(key, ext)
+            return ext
+        # fallback
+        reply = await local_ai_generate(channel_id, username, user_message)
+        ai_cache.put(key, reply)
+        return reply
+
+    # mode == 'external'
+    ext = await ask_ai_external(messages, channel_id, username, user_message)
+    if ext:
+        ai_cache.put(key, ext)
+        return ext
+
+    # final fallback local
+    reply = await local_ai_generate(channel_id, username, user_message)
+    ai_cache.put(key, reply)
+    return reply
 
 
 def clear_history(channel_id: int):
@@ -278,7 +345,8 @@ async def help_nova(ctx: commands.Context):
 async def ai_command(ctx: commands.Context, *, args: str = ""):
     if args.strip().lower() == "limpar":
         clear_history(ctx.channel.id)
-        await ctx.send("Histórico de conversa deste canal foi limpo.")
+        ai_cache.clear()
+        await ctx.send("Histórico de conversa e cache limpos.")
         return
 
     if not args.strip():
@@ -288,17 +356,28 @@ async def ai_command(ctx: commands.Context, *, args: str = ""):
         )
         return
 
+    # quick cache check
+    key = (ctx.channel.id, args.strip().lower())
+    cached = ai_cache.get(key)
+    if cached:
+        await ctx.send(cached if len(cached) <= 1900 else cached[:1900])
+        return
+
     async with ctx.typing():
         try:
-            resposta = await ask_ai(ctx.channel.id, ctx.author.name, args)
-            if len(resposta) <= 1900:
+            # For guild-based mode, use guild id as key if available
+            guild_id = ctx.guild.id if ctx.guild else 0
+            # set conversation key to channel id for history
+            reply = await ask_ai(ctx.channel.id, ctx.author.name, args)
+            # send
+            if len(reply) <= 1900:
                 embed = discord.Embed(color=0x5865F2)
                 embed.set_author(name=f"{ctx.author.display_name} perguntou:")
-                embed.description = f"> {args}\n\n{resposta}"
+                embed.description = f"> {args}\n\n{reply}"
                 embed.set_footer(text="Nova Era IA")
                 await ctx.send(embed=embed)
             else:
-                chunks = [resposta[i:i+1900] for i in range(0, len(resposta), 1900)]
+                chunks = [reply[i:i+1900] for i in range(0, len(reply), 1900)]
                 await ctx.send(f"{ctx.author.display_name} perguntou: {args}\n\n{chunks[0]}")
                 for chunk in chunks[1:]:
                     await ctx.send(chunk)
@@ -306,6 +385,19 @@ async def ai_command(ctx: commands.Context, *, args: str = ""):
             print(f"[ERRO] comando !ai falhou: {e}")
             traceback.print_exc()
             await ctx.send("A IA está indisponível no momento. Tente novamente.")
+
+
+@bot.command(name="aimode")
+@commands.has_guild_permissions(administrator=True)
+async def aimode(ctx: commands.Context, mode: str):
+    """Define o modo de IA para este servidor: local, external ou auto."""
+    mode = mode.lower()
+    if mode not in ("local", "external", "auto"):
+        await ctx.send("Modo inválido. Use: local, external ou auto.")
+        return
+    gid = ctx.guild.id if ctx.guild else 0
+    ai_mode_by_guild[gid] = mode
+    await ctx.send(f"Modo de IA deste servidor definido para: {mode}")
 
 
 @bot.command(name="aistatus")
@@ -322,6 +414,9 @@ async def aistatus(ctx: commands.Context):
             results.append(f"{provider.__name__}: ERRO ({e})")
     await ctx.send("\n".join(results))
 
+
+# Moderation and utility commands (ban/kick/timeout/warn/clear/userinfo) kept as before
+# ... (kept unchanged for brevity) - copy from previous implementation
 
 @bot.command(name="ban")
 @commands.has_permissions(ban_members=True)
