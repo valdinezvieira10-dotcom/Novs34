@@ -5,6 +5,7 @@
 import os
 import random
 import asyncio
+import traceback
 from datetime import timedelta, datetime
 from collections import defaultdict
 from typing import Optional
@@ -24,9 +25,11 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# ─── Ajutes de performance ───────────────────────────────────────────────────
-G4F_TIMEOUT = 10  # segundos por provedor (reduzido)
-G4F_CONCURRENCY = 3  # quantas chamadas concorrentes a provedores externas
+# ─── Configuráveis via ambiente (tune conforme infra) ────────────────────────
+G4F_TIMEOUT = int(os.getenv("G4F_TIMEOUT", "25"))        # segundos por provedor
+G4F_CONCURRENCY = int(os.getenv("G4F_CONCURRENCY", "2")) # chamadas concorrentes
+MAX_PROVIDER_RETRIES = int(os.getenv("G4F_RETRIES", "1"))
+PROVIDER_RETRY_DELAY = float(os.getenv("G4F_RETRY_DELAY", "1"))
 ai_semaphore = asyncio.Semaphore(G4F_CONCURRENCY)
 
 # ─── Help embed ───────────────────────────────────────────────────────────────
@@ -158,31 +161,40 @@ async def ask_ai(channel_id: int, username: str, user_message: str) -> str:
     # Limita concorrência em chamadas externas para evitar sobrecarga
     async with ai_semaphore:
         for provider in (Yqcloud, OperaAria):
-            try:
-                reply = await asyncio.wait_for(_call_g4f_in_thread(messages, provider), timeout=G4F_TIMEOUT)
-                reply = (reply or "").strip()
-                if not reply:
-                    raise Exception("Resposta vazia do provedor")
+            attempt = 0
+            while attempt <= MAX_PROVIDER_RETRIES:
+                try:
+                    reply = await asyncio.wait_for(_call_g4f_in_thread(messages, provider), timeout=G4F_TIMEOUT)
+                    reply = (reply or "").strip()
+                    if not reply:
+                        raise Exception("Resposta vazia do provedor")
 
-                # atualiza histórico
-                history.append({"username": username, "content": user_message, "role": "user"})
-                history.append({"username": "Nova Era", "content": reply, "role": "bot"})
-                if len(history) > MAX_HISTORY:
-                    del history[:len(history) - MAX_HISTORY]
+                    # atualiza histórico
+                    history.append({"username": username, "content": user_message, "role": "user"})
+                    history.append({"username": "Nova Era", "content": reply, "role": "bot"})
+                    if len(history) > MAX_HISTORY:
+                        del history[:len(history) - MAX_HISTORY]
 
-                return reply
-            except asyncio.TimeoutError:
-                last_error = Exception(f"Timeout de {G4F_TIMEOUT}s ao chamar {provider.__name__}")
-                print(f"[AVISO] {provider.__name__} timeout.")
-            except Exception as e:
-                last_error = e
-                print(f"[AVISO] {provider.__name__} falhou: {e}")
+                    return reply
+                except asyncio.TimeoutError:
+                    last_error = Exception(f"Timeout de {G4F_TIMEOUT}s ao chamar {provider.__name__}")
+                    print(f"[AVISO] {provider.__name__} timeout (attempt {attempt}).")
+                    traceback.print_exc()
+                except Exception as e:
+                    last_error = e
+                    print(f"[AVISO] {provider.__name__} falhou (attempt {attempt}): {e}")
+                    traceback.print_exc()
+
+                attempt += 1
+                if attempt <= MAX_PROVIDER_RETRIES:
+                    await asyncio.sleep(PROVIDER_RETRY_DELAY)
 
     # Fallback local sem semaphore (rápido)
     try:
         return await local_ai_generate(channel_id, username, user_message)
     except Exception as e:
         print(f"[ERRO] IA local também falhou: {e}")
+        traceback.print_exc()
         raise last_error or e or Exception("IA indisponível")
 
 
@@ -245,12 +257,14 @@ async def on_member_join(member: discord.Member):
             sent = True
         except Exception as e:
             print(f"[AVISO] Falha ao enviar boas-vindas em canal {target_channel}: {e}")
+            traceback.print_exc()
 
     if not sent:
         try:
             await member.send(welcome_text)
         except Exception as e:
             print(f"[AVISO] Não foi possível enviar DM ao membro {member}: {e}")
+            traceback.print_exc()
 
 
 # ─── Comandos de prefixo '!' (mantidos) ──────────────────────────────────────
@@ -290,7 +304,23 @@ async def ai_command(ctx: commands.Context, *, args: str = ""):
                     await ctx.send(chunk)
         except Exception as e:
             print(f"[ERRO] comando !ai falhou: {e}")
+            traceback.print_exc()
             await ctx.send("A IA está indisponível no momento. Tente novamente.")
+
+
+@bot.command(name="aistatus")
+async def aistatus(ctx: commands.Context):
+    """Roda um probe rápido nos provedores g4f para diagnóstico."""
+    results = []
+    for provider in (Yqcloud, OperaAria):
+        try:
+            await asyncio.wait_for(_call_g4f_in_thread([{"role":"system","content":"ping"}], provider), timeout=G4F_TIMEOUT)
+            results.append(f"{provider.__name__}: OK")
+        except asyncio.TimeoutError:
+            results.append(f"{provider.__name__}: TIMEOUT")
+        except Exception as e:
+            results.append(f"{provider.__name__}: ERRO ({e})")
+    await ctx.send("\n".join(results))
 
 
 @bot.command(name="ban")
@@ -310,6 +340,7 @@ async def ban_command(ctx: commands.Context, membro: discord.Member, dias: int =
         await ctx.send(embed=embed)
     except Exception as e:
         print(f"[ERRO] ao banir: {e}")
+        traceback.print_exc()
         await ctx.send("Erro ao banir o membro.")
 
 
@@ -329,6 +360,7 @@ async def kick_command(ctx: commands.Context, membro: discord.Member, *, motivo:
         await ctx.send(embed=embed)
     except Exception as e:
         print(f"[ERRO] ao expulsar: {e}")
+        traceback.print_exc()
         await ctx.send("Erro ao expulsar o membro.")
 
 
@@ -347,6 +379,7 @@ async def timeout_command(ctx: commands.Context, membro: discord.Member, minutos
         await ctx.send(embed=embed)
     except Exception as e:
         print(f"[ERRO] ao aplicar timeout: {e}")
+        traceback.print_exc()
         await ctx.send("Erro ao silenciar o membro.")
 
 
@@ -414,6 +447,7 @@ async def clear_command(ctx: commands.Context, quantidade: int = 10, membro: Opt
             pass
     except Exception as e:
         print(f"[ERRO] ao apagar mensagens: {e}")
+        traceback.print_exc()
         await ctx.send("Erro ao apagar mensagens.")
 
 
